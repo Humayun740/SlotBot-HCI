@@ -57,7 +57,10 @@ export const RecommendationCard: React.FC<RecommendationCardProps> = ({
       <h3 className="text-base font-bold text-slate-900 leading-snug">
         {isBest ? (
           <span>
-            Today 2:00 PM – 3:00 PM <span className="text-slate-600 font-semibold text-sm">(4/4 free, ends 30 min before bus)</span>
+            {recommendation.timeRange}{' '}
+            <span className="text-slate-600 font-semibold text-sm">
+              ({recommendation.freeCount}/{recommendation.totalMembers} free, {recommendation.bufferNote})
+            </span>
           </span>
         ) : (
           <span>{recommendation.timeRange}</span>

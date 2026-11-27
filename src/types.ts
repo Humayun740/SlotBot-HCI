@@ -13,7 +13,7 @@ export interface TimeSlot {
   bufferBeforeBusMinutes?: number;
 }
 
-export type AvailabilityStatus = 'free' | 'busy' | 'unset';
+export type AvailabilityStatus = 'free' | 'conditional' | 'busy' | 'unset';
 
 export interface TeamMember {
   id: string;

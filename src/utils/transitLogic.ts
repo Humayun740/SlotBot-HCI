@@ -68,7 +68,8 @@ export function generatePrototypeSlots(
   day: DayOption = 'today',
   durationMinutes: number = 60,
   busCutoffStr: string = '15:30',
-  bufferMinutes: number = 30
+  bufferMinutes: number = 30,
+  overrideCutoff: boolean = false
 ): TimeSlot[] {
   if (day === 'today') {
     if (durationMinutes === 60) {
@@ -81,6 +82,7 @@ export function generatePrototypeSlots(
 
       return blocks.map(block => {
         const viability = evaluateSlotTransitViability(block.end, busCutoffStr, bufferMinutes);
+        const isBlocked = overrideCutoff ? false : !viability.isViable;
         return {
           id: `today-${block.start.replace(':', '')}-${block.end.replace(':', '')}`,
           day: 'today',
@@ -89,14 +91,15 @@ export function generatePrototypeSlots(
           displayTime: block.label,
           displayFull: `Today ${format24To12(block.start)} – ${format24To12(block.end)}`,
           durationMinutes: 60,
-          isPreBlocked: !viability.isViable,
-          blockedReason: viability.reason,
+          isPreBlocked: isBlocked,
+          blockedReason: isBlocked ? viability.reason : undefined,
           bufferBeforeBusMinutes: viability.minutesRemainingBeforeBus
         };
       });
     } else {
       // 30-minute fallback blocks
       const blocks = [
+        { start: '13:00', end: '13:30', label: '1:00–1:30' },
         { start: '13:15', end: '13:45', label: '1:15–1:45' },
         { start: '14:00', end: '14:30', label: '2:00–2:30' },
         { start: '14:30', end: '15:00', label: '2:30–3:00' },
@@ -105,6 +108,7 @@ export function generatePrototypeSlots(
 
       return blocks.map(block => {
         const viability = evaluateSlotTransitViability(block.end, busCutoffStr, bufferMinutes);
+        const isBlocked = overrideCutoff ? false : !viability.isViable;
         return {
           id: `today-30m-${block.start.replace(':', '')}-${block.end.replace(':', '')}`,
           day: 'today',
@@ -113,19 +117,27 @@ export function generatePrototypeSlots(
           displayTime: block.label,
           displayFull: `Today ${format24To12(block.start)} – ${format24To12(block.end)} (30 min)`,
           durationMinutes: 30,
-          isPreBlocked: !viability.isViable,
-          blockedReason: viability.reason,
+          isPreBlocked: isBlocked,
+          blockedReason: isBlocked ? viability.reason : undefined,
           bufferBeforeBusMinutes: viability.minutesRemainingBeforeBus
         };
       });
     }
   } else {
     // Tomorrow slots (Alternative recovery path)
-    const blocks = [
-      { start: '11:00', end: '12:00', label: '11:00–12:00', note: 'Ends 210m before bus' },
-      { start: '13:00', end: '14:00', label: '1:00–2:00', note: 'Ends 90m before bus' },
-      { start: '14:00', end: '15:00', label: '2:00–3:00', note: 'Ends 30m before bus' }
-    ];
+    const cutoffMin = timeStringToMinutes(busCutoffStr);
+    const blocks =
+      cutoffMin < timeStringToMinutes('15:30')
+        ? [
+            { start: '10:00', end: '11:00', label: '10:00–11:00' },
+            { start: '11:00', end: '12:00', label: '11:00–12:00' },
+            { start: '12:30', end: '13:30', label: '12:30–1:30' }
+          ]
+        : [
+            { start: '11:00', end: '12:00', label: '11:00–12:00' },
+            { start: '13:00', end: '14:00', label: '1:00–2:00' },
+            { start: '14:00', end: '15:00', label: '2:00–3:00' }
+          ];
 
     return blocks.map(block => {
       const viability = evaluateSlotTransitViability(block.end, busCutoffStr, bufferMinutes);
@@ -221,7 +233,10 @@ export function buildRecommendedCards(
         timeRange: `Today ${format24To12(primaryToday.startTime)} – ${format24To12(primaryToday.endTime)}`,
         freeCount: 4,
         totalMembers: 4,
-        bufferNote: `ends ${primaryToday.bufferBeforeBusMinutes} min before bus`,
+        bufferNote:
+          primaryToday.bufferBeforeBusMinutes !== undefined && primaryToday.bufferBeforeBusMinutes > 0
+            ? `ends ${primaryToday.bufferBeforeBusMinutes} min before bus`
+            : 'Transit cutoff overridden for today',
         slot: primaryToday,
         tagline: 'Best mutual availability today with guaranteed transit safety'
       });

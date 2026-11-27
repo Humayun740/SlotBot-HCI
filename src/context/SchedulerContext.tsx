@@ -39,6 +39,10 @@ interface SchedulerContextType {
   activeSlots: TimeSlot[];
   bilalSelections: Record<string, AvailabilityStatus>;
   setSlotSelection: (slotId: string, status: AvailabilityStatus) => void;
+  bilalConditionalNotes: Record<string, string>;
+  setConditionalNote: (slotId: string, note: string) => void;
+  cutoffOverrideActive: boolean;
+  setCutoffOverrideActive: (active: boolean) => void;
 
   // Team & Status
   teamMembers: TeamMember[];
@@ -47,11 +51,15 @@ interface SchedulerContextType {
   // Recommendations & Feedback
   recommendations: RecommendedSlot[];
   confirmedSlot: RecommendedSlot | null;
+  pendingConfirmSlot: RecommendedSlot | null;
+  undoSecondsLeft: number;
   pinnedBanner: string | null;
 
   // Error & Fallback
   isErrorState: boolean;
   recoveryNote: string | null;
+  shorten30mViableCount: number;
+  suggestTomorrowViableCount: number;
 
   // Synthesis loading
   isSynthesizing: boolean;
@@ -68,6 +76,10 @@ interface SchedulerContextType {
   // Action Triggers
   invokeSlotBot: (customText?: string) => void;
   submitBilalAvailability: () => void;
+  requestConfirmSlot: (slot: RecommendedSlot) => void;
+  cancelConfirmSlot: () => void;
+  confirmPendingSlot: () => void;
+  undoConfirmation: () => void;
   confirmSlot: (slot: RecommendedSlot) => void;
   executeRecovery: (action: 'suggest_tomorrow' | 'shorten_30m') => void;
 
@@ -94,11 +106,15 @@ export const SchedulerProvider: React.FC<{ children: ReactNode }> = ({ children 
   const [bilalSelections, setBilalSelections] = useState<Record<string, AvailabilityStatus>>({
     'today-1400-1500': 'free'
   });
+  const [bilalConditionalNotes, setBilalConditionalNotes] = useState<Record<string, string>>({});
+  const [cutoffOverrideActive, setCutoffOverrideActive] = useState<boolean>(false);
 
   // Flow & State
   const [scenarioPreset, setScenarioPreset] = useState<ScenarioPreset>('happy_path');
   const [isSynthesizing, setIsSynthesizing] = useState<boolean>(false);
   const [confirmedSlot, setConfirmedSlot] = useState<RecommendedSlot | null>(null);
+  const [pendingConfirmSlot, setPendingConfirmSlot] = useState<RecommendedSlot | null>(null);
+  const [undoSecondsLeft, setUndoSecondsLeft] = useState<number>(0);
   const [pinnedBanner, setPinnedBanner] = useState<string | null>(null);
   const [recoveryNote, setRecoveryNote] = useState<string | null>(null);
 
@@ -114,22 +130,36 @@ export const SchedulerProvider: React.FC<{ children: ReactNode }> = ({ children 
     { id: 'carlos', name: 'Carlos', role: 'Teammate', avatarColor: 'bg-purple-600', initials: 'C', isCommuter: false, hasReplied: true },
   ];
 
-  // Calculate slots dynamically based on current busCutoff and buffer
+  // Calculate slots dynamically based on current busCutoff, buffer, and one-time override
   const slotsToday = useMemo(() => {
-    return generatePrototypeSlots('today', meetingDuration, busCutoff, transitBufferMinutes);
-  }, [meetingDuration, busCutoff, transitBufferMinutes]);
+    return generatePrototypeSlots('today', meetingDuration, busCutoff, transitBufferMinutes, cutoffOverrideActive);
+  }, [meetingDuration, busCutoff, transitBufferMinutes, cutoffOverrideActive]);
 
   const slotsTomorrow = useMemo(() => {
-    return generatePrototypeSlots('tomorrow', meetingDuration, busCutoff, transitBufferMinutes);
+    return generatePrototypeSlots('tomorrow', meetingDuration, busCutoff, transitBufferMinutes, false);
   }, [meetingDuration, busCutoff, transitBufferMinutes]);
 
   const activeSlots = meetingDay === 'today' ? slotsToday : slotsTomorrow;
 
+  // Predictive viable counts for Screen 4 recovery buttons
+  const shorten30mViableCount = useMemo(() => {
+    return generatePrototypeSlots('today', 30, busCutoff, transitBufferMinutes, cutoffOverrideActive).filter(
+      s => !s.isPreBlocked
+    ).length;
+  }, [busCutoff, transitBufferMinutes, cutoffOverrideActive]);
+
+  const suggestTomorrowViableCount = useMemo(() => {
+    return generatePrototypeSlots('tomorrow', 60, busCutoff, transitBufferMinutes, false).filter(
+      s => !s.isPreBlocked
+    ).length;
+  }, [busCutoff, transitBufferMinutes]);
+
   // Determine if all slots today are blocked or if scenario forces no viable slots
   const hasViableTodaySlot = useMemo(() => {
+    if (cutoffOverrideActive) return slotsToday.some(s => !s.isPreBlocked);
     if (scenarioPreset === 'no_viable_slots') return false;
     return slotsToday.some(s => !s.isPreBlocked);
-  }, [slotsToday, scenarioPreset]);
+  }, [slotsToday, scenarioPreset, cutoffOverrideActive]);
 
   // Recommendations calculation
   const recommendations = useMemo(() => {
@@ -183,6 +213,15 @@ export const SchedulerProvider: React.FC<{ children: ReactNode }> = ({ children 
     }
   ]);
 
+  // 10-second Undo countdown timer
+  useEffect(() => {
+    if (undoSecondsLeft <= 0) return;
+    const timer = setTimeout(() => {
+      setUndoSecondsLeft(prev => Math.max(0, prev - 1));
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [undoSecondsLeft]);
+
   // Replied count: 3 of 4 if waiting for Bilal, 4 of 4 if Bilal submitted
   const repliedCount = flowStage === 'collecting' || flowStage === 'unrequested' ? 3 : 4;
 
@@ -194,13 +233,36 @@ export const SchedulerProvider: React.FC<{ children: ReactNode }> = ({ children 
     }));
   };
 
+  // Handle optional note for conditional availability
+  const setConditionalNote = (slotId: string, note: string) => {
+    setBilalConditionalNotes(prev => ({
+      ...prev,
+      [slotId]: note
+    }));
+  };
+
   // Trigger @SlotBot invocation in group chat
   const invokeSlotBot = (customText?: string) => {
     const promptText = customText || '@SlotBot meeting today, 1 hour';
+    const lower = promptText.toLowerCase();
     const now = '12:41 PM';
+
+    if (lower.includes('tomorrow')) {
+      setMeetingDay('tomorrow');
+    } else {
+      setMeetingDay('today');
+    }
+
+    if (lower.includes('30 min') || lower.includes('30m') || lower.includes('30-min')) {
+      setMeetingDuration(30);
+    } else {
+      setMeetingDuration(60);
+    }
 
     setFlowStage('collecting');
     setConfirmedSlot(null);
+    setPendingConfirmSlot(null);
+    setUndoSecondsLeft(0);
     setPinnedBanner(null);
 
     setGroupMessages([
@@ -241,7 +303,13 @@ export const SchedulerProvider: React.FC<{ children: ReactNode }> = ({ children 
     setTimeout(() => {
       setIsSynthesizing(false);
 
-      if (!hasViableTodaySlot || scenarioPreset === 'no_viable_slots') {
+      const shouldFail =
+        !cutoffOverrideActive &&
+        meetingDay === 'today' &&
+        meetingDuration === 60 &&
+        (!hasViableTodaySlot || scenarioPreset === 'no_viable_slots');
+
+      if (shouldFail) {
         // Fallback error state
         setFlowStage('fallback_error');
         // Add SlotBot error message to group
@@ -270,7 +338,9 @@ export const SchedulerProvider: React.FC<{ children: ReactNode }> = ({ children 
             senderName: 'SlotBot',
             isBot: true,
             timestamp: '12:45 PM',
-            text: 'Everyone has replied. Ranked for all 4 members, with a 30-min transit buffer.',
+            text: cutoffOverrideActive
+              ? 'Everyone has replied. Ranked for all 4 members (one-time transit cutoff override applied).'
+              : 'Everyone has replied. Ranked for all 4 members, with a 30-min transit buffer.',
             type: 'recommendation_container'
           }
         ]);
@@ -283,10 +353,12 @@ export const SchedulerProvider: React.FC<{ children: ReactNode }> = ({ children 
     }, 1200);
   };
 
-  // Confirm slot
+  // Confirm slot (direct)
   const confirmSlot = (slot: RecommendedSlot) => {
     setConfirmedSlot(slot);
+    setPendingConfirmSlot(null);
     setFlowStage('confirmed');
+    setUndoSecondsLeft(10);
     const banner = `📌 Project meeting confirmed for ${slot.timeRange} in Seminar Room 4B`;
     setPinnedBanner(banner);
 
@@ -300,7 +372,43 @@ export const SchedulerProvider: React.FC<{ children: ReactNode }> = ({ children 
         senderName: 'SlotBot',
         isBot: true,
         timestamp: '12:46 PM',
-        text: `✅ Meeting locked! ${slot.timeRange} has been scheduled on everyone's calendar. Bilal leaves 30m safe buffer before the ${format24To12(busCutoff)} university bus.`
+        text: cutoffOverrideActive
+          ? `✅ Meeting locked! ${slot.timeRange} has been scheduled on everyone's calendar (one-time transit override active).`
+          : `✅ Meeting locked! ${slot.timeRange} has been scheduled on everyone's calendar. Bilal leaves 30m safe buffer before the ${format24To12(busCutoff)} university bus.`
+      }
+    ]);
+  };
+
+  // 2-step confirmation flow
+  const requestConfirmSlot = (slot: RecommendedSlot) => {
+    setPendingConfirmSlot(slot);
+  };
+
+  const cancelConfirmSlot = () => {
+    setPendingConfirmSlot(null);
+  };
+
+  const confirmPendingSlot = () => {
+    if (pendingConfirmSlot) {
+      confirmSlot(pendingConfirmSlot);
+    }
+  };
+
+  const undoConfirmation = () => {
+    setConfirmedSlot(null);
+    setPinnedBanner(null);
+    setUndoSecondsLeft(0);
+    setFlowStage('recommended');
+    setGroupMessages(prev => [
+      ...prev,
+      {
+        id: `g-${Date.now()}-undo`,
+        chat: 'group',
+        senderId: 'slotbot',
+        senderName: 'SlotBot',
+        isBot: true,
+        timestamp: '12:46 PM',
+        text: '↩️ Meeting lock undone. Please select and confirm a time slot above.'
       }
     ]);
   };
@@ -366,8 +474,12 @@ export const SchedulerProvider: React.FC<{ children: ReactNode }> = ({ children 
   const loadScenario = (preset: ScenarioPreset) => {
     setScenarioPreset(preset);
     setConfirmedSlot(null);
+    setPendingConfirmSlot(null);
+    setUndoSecondsLeft(0);
     setPinnedBanner(null);
     setRecoveryNote(null);
+    setCutoffOverrideActive(false);
+    setBilalConditionalNotes({});
 
     if (preset === 'happy_path') {
       setBusCutoff('15:30');
@@ -487,13 +599,21 @@ export const SchedulerProvider: React.FC<{ children: ReactNode }> = ({ children 
         activeSlots,
         bilalSelections,
         setSlotSelection,
+        bilalConditionalNotes,
+        setConditionalNote,
+        cutoffOverrideActive,
+        setCutoffOverrideActive,
         teamMembers,
         repliedCount,
         recommendations,
         confirmedSlot,
+        pendingConfirmSlot,
+        undoSecondsLeft,
         pinnedBanner,
         isErrorState,
         recoveryNote,
+        shorten30mViableCount,
+        suggestTomorrowViableCount,
         isSynthesizing,
         scenarioPreset,
         loadScenario,
@@ -504,6 +624,10 @@ export const SchedulerProvider: React.FC<{ children: ReactNode }> = ({ children 
         setShowGestaltOverlay,
         invokeSlotBot,
         submitBilalAvailability,
+        requestConfirmSlot,
+        cancelConfirmSlot,
+        confirmPendingSlot,
+        undoConfirmation,
         confirmSlot,
         executeRecovery,
         groupMessages,
